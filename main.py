@@ -1,12 +1,16 @@
-import os
-import io
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage
+from openai import OpenAI
+import os
+import hashlib
+import httpx
+from dotenv import load_dotenv
 import pdfplumber
 import docx
+import io
+
+load_dotenv()
 
 app = FastAPI()
 
@@ -17,130 +21,121 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    api_key=OPENAI_API_KEY,
-    temperature=0.7
-)
+SUPABASE_URL = "https://jizieprrymxrtjnxdewy.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImppemllcHJyeW14cnRqbnhkZXd5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIzODY2MTgsImV4cCI6MjA5Nzk2MjYxOH0.pvDT5l7fFWtsEpsZXtp8gmH39YQSWimKLJM2h6sRYUo"
 
-system_prompt = """You are a helpful AI assistant. You love programming and robotics, 
-and you are an expert in deep learning and natural language processing."""
+SUPABASE_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+}
 
-conversation_history = []
+conversation_history = {}
+uploaded_files = {}
 
-# Store uploaded file content in memory
-uploaded_file_content = {}
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
 
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
 
 class ChatRequest(BaseModel):
     message: str
-    session_id: str = "default"
-
+    user_id: str = "default"
 
 @app.get("/")
 def root():
     return {"status": "AI Chatbot API is running"}
 
+@app.post("/signup")
+async def signup(req: SignupRequest):
+    hashed = hash_password(req.password)
+    async with httpx.AsyncClient() as c:
+        # Check if user exists
+        check = await c.get(
+            f"{SUPABASE_URL}/rest/v1/users?email=eq.{req.email}",
+            headers=SUPABASE_HEADERS
+        )
+        if check.json():
+            raise HTTPException(status_code=400, detail="Email already registered")
+        
+        # Insert new user
+        res = await c.post(
+            f"{SUPABASE_URL}/rest/v1/users",
+            headers={**SUPABASE_HEADERS, "Prefer": "return=representation"},
+            json={"email": req.email, "password": hashed}
+        )
+        if res.status_code not in [200, 201]:
+            raise HTTPException(status_code=500, detail="Signup failed")
+        
+        user = res.json()[0]
+        return {"message": "Account created!", "user_id": user["id"], "email": user["email"]}
+
+@app.post("/login")
+async def login(req: LoginRequest):
+    hashed = hash_password(req.password)
+    async with httpx.AsyncClient() as c:
+        res = await c.get(
+            f"{SUPABASE_URL}/rest/v1/users?email=eq.{req.email}&password=eq.{hashed}",
+            headers=SUPABASE_HEADERS
+        )
+        users = res.json()
+        if not users:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        
+        user = users[0]
+        return {"message": "Login successful!", "user_id": user["id"], "email": user["email"]}
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...), session_id: str = "default"):
-    filename = file.filename.lower()
+async def upload_file(file: UploadFile = File(...), user_id: str = "default"):
     content = await file.read()
-
-    try:
-        if filename.endswith(".pdf"):
-            text = extract_pdf(content)
-        elif filename.endswith(".docx"):
-            text = extract_docx(content)
-        elif filename.endswith(".txt"):
-            text = content.decode("utf-8")
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported file type. Use PDF, DOCX, or TXT.")
-
-        if not text.strip():
-            raise HTTPException(status_code=400, detail="File is empty or could not be read.")
-
-        # Save extracted text linked to session
-        uploaded_file_content[session_id] = {
-            "filename": file.filename,
-            "text": text[:15000]  # limit to avoid token overflow
-        }
-
-        return {
-            "message": f"File '{file.filename}' uploaded successfully!",
-            "preview": text[:300] + "..." if len(text) > 300 else text
-        }
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error reading file: {str(e)}")
-
-
-def extract_pdf(content: bytes) -> str:
     text = ""
-    with pdfplumber.open(io.BytesIO(content)) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-    return text
-
-
-def extract_docx(content: bytes) -> str:
-    doc = docx.Document(io.BytesIO(content))
-    return "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
-
+    
+    if file.filename.endswith(".pdf"):
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            for page in pdf.pages:
+                text += page.extract_text() or ""
+    elif file.filename.endswith(".docx"):
+        doc = docx.Document(io.BytesIO(content))
+        text = "\n".join([p.text for p in doc.paragraphs])
+    elif file.filename.endswith(".txt"):
+        text = content.decode("utf-8")
+    else:
+        raise HTTPException(status_code=400, detail="Only PDF, DOCX, TXT supported")
+    
+    uploaded_files[user_id] = text[:5000]
+    return {"message": f"File '{file.filename}' uploaded successfully!"}
 
 @app.post("/chat")
-async def chat(request: ChatRequest):
-    session_id = request.session_id
+async def chat(req: ChatRequest):
+    if req.user_id not in conversation_history:
+        conversation_history[req.user_id] = []
 
-    # Build system prompt — inject file content if uploaded
-    if session_id in uploaded_file_content:
-        file_info = uploaded_file_content[session_id]
-        active_system = f"""{system_prompt}
+    system_prompt = "You are a helpful AI assistant. You love programming and robotics. You are an expert in deep learning and NLP."
+    
+    if req.user_id in uploaded_files:
+        system_prompt += f"\n\nThe user has uploaded a file. Use this content to answer their questions:\n\n{uploaded_files[req.user_id]}"
 
-The user has uploaded a file named '{file_info["filename"]}'. 
-Answer all questions based on the content of this file.
-If the answer is not in the file, say so clearly.
+    conversation_history[req.user_id].append({"role": "user", "content": req.message})
 
-FILE CONTENT:
-{file_info["text"]}"""
-    else:
-        active_system = system_prompt
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "system", "content": system_prompt}] + conversation_history[req.user_id]
+    )
 
-    messages = [SystemMessage(content=active_system)]
+    reply = response.choices[0].message.content
+    conversation_history[req.user_id].append({"role": "assistant", "content": reply})
 
-    # Add conversation history for this session
-    session_history = [m for m in conversation_history if m.get("session") == session_id]
-    for msg in session_history[-10:]:  # last 10 messages only
-        if msg["role"] == "user":
-            messages.append(HumanMessage(content=msg["content"]))
-        else:
-            from langchain_core.messages import AIMessage
-            messages.append(AIMessage(content=msg["content"]))
+    return {"reply": reply}
 
-    messages.append(HumanMessage(content=request.message))
-
-    try:
-        response = llm.invoke(messages)
-        reply = response.content
-
-        conversation_history.append({"session": session_id, "role": "user", "content": request.message})
-        conversation_history.append({"session": session_id, "role": "assistant", "content": reply})
-
-        return {"reply": reply}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.delete("/clear/{session_id}")
-async def clear_session(session_id: str):
-    global conversation_history
-    conversation_history = [m for m in conversation_history if m.get("session") != session_id]
-    uploaded_file_content.pop(session_id, None)
-    return {"message": "Session cleared"}
+@app.delete("/clear-file/{user_id}")
+def clear_file(user_id: str):
+    uploaded_files.pop(user_id, None)
+    return {"message": "File cleared"}
