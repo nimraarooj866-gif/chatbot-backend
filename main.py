@@ -118,10 +118,10 @@ async def chat(req: ChatRequest):
     if req.user_id not in conversation_history:
         conversation_history[req.user_id] = []
 
-    system_prompt = "You are a helpful AI assistant. You love programming and robotics. You are an expert in deep learning and NLP."
+    system_prompt = "You are a helpful AI assistant expert in programming, robotics, deep learning and NLP. Always respond in the same language the user writes in."
     
     if req.user_id in uploaded_files:
-        system_prompt += f"\n\nThe user has uploaded a file. Use this content to answer their questions:\n\n{uploaded_files[req.user_id]}"
+        system_prompt += f"\n\nThe user has uploaded a file. Here is its content:\n\n{uploaded_files[req.user_id]}\n\nAnswer questions based on this file content. If the user asks something unrelated to the file, you can still help them."
 
     conversation_history[req.user_id].append({"role": "user", "content": req.message})
 
