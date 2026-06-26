@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
-import os, io, httpx, random, string
+import os, io, httpx
 from dotenv import load_dotenv
 import pdfplumber
 import docx
@@ -21,19 +21,17 @@ app.add_middleware(
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 SUPABASE_URL = "https://jizieprrymxrtjnxdewy.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImppemllcHJyeW14cnRqbnhkZXd5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIzODY2MTgsImV4cCI6MjA5Nzk2MjYxOH0.pvDT5l7fFWtsEpsZXtp8gmH39YQSWimKLJM2h6sRYUo"
+SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImppemllcHJyeW14cnRqbnhkZXd5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIzODY2MTgsImV4cCI6MjA5Nzk2MjYxOH0.pvDT5l7fFWtsEpsZXtp8gmH39YQSWimKLJM2h6sRYUo"
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # Add this in Railway
 SUPABASE_AUTH = f"{SUPABASE_URL}/auth/v1"
-SUPABASE_HEADERS = {
-    "apikey": SUPABASE_KEY,
+
+ANON_HEADERS = {
+    "apikey": SUPABASE_ANON_KEY,
     "Content-Type": "application/json",
 }
 
-SMTP_EMAIL = os.getenv("SMTP_EMAIL")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-
 conversation_history = {}
 uploaded_files = {}
-login_otp_store = {}  # email -> otp (temporary in-memory)
 
 class ChatRequest(BaseModel):
     message: str
@@ -54,13 +52,13 @@ async def signup(body: dict):
     async with httpx.AsyncClient() as c:
         res = await c.post(
             f"{SUPABASE_AUTH}/signup",
-            headers=SUPABASE_HEADERS,
+            headers=ANON_HEADERS,
             json={"email": email, "password": password}
         )
         data = res.json()
         if res.status_code not in [200, 201]:
             raise HTTPException(400, data.get("msg", data.get("message", "Signup failed")))
-        return {"message": "OTP sent to your email. Please verify.", "email": email}
+        return {"message": "OTP sent to your email.", "email": email}
 
 # ── VERIFY SIGNUP OTP ───────────────────────────────────
 @app.post("/verify-otp")
@@ -72,7 +70,7 @@ async def verify_otp(body: dict):
     async with httpx.AsyncClient() as c:
         res = await c.post(
             f"{SUPABASE_AUTH}/verify",
-            headers=SUPABASE_HEADERS,
+            headers=ANON_HEADERS,
             json={"email": email, "token": token, "type": otp_type}
         )
         data = res.json()
@@ -86,7 +84,7 @@ async def verify_otp(body: dict):
             "access_token": data.get("access_token")
         }
 
-# ── LOGIN STEP 1: Verify password, then send OTP via Supabase magic link ──
+# ── LOGIN STEP 1: Verify password, then send OTP via Supabase Admin ──
 @app.post("/login/send-otp")
 async def login_send_otp(body: dict):
     email = body.get("email")
@@ -95,25 +93,30 @@ async def login_send_otp(body: dict):
         raise HTTPException(400, "Email and password required")
 
     async with httpx.AsyncClient() as c:
-        # Step 1: Verify password is correct
+        # Step 1: Verify password
         res = await c.post(
             f"{SUPABASE_AUTH}/token?grant_type=password",
-            headers=SUPABASE_HEADERS,
+            headers=ANON_HEADERS,
             json={"email": email, "password": password}
         )
         data = res.json()
         if res.status_code != 200:
             raise HTTPException(400, data.get("error_description", "Invalid email or password"))
 
-        # Step 2: Password correct — now send OTP via magic link
+        # Step 2: Send OTP using Supabase Admin API (reauthentication OTP)
+        service_headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+            "Content-Type": "application/json",
+        }
         otp_res = await c.post(
-            f"{SUPABASE_AUTH}/magiclink",
-            headers=SUPABASE_HEADERS,
+            f"{SUPABASE_AUTH}/otp",
+            headers=service_headers,
             json={"email": email, "create_user": False}
         )
         if otp_res.status_code not in [200, 201, 204]:
             otp_data = otp_res.json()
-            raise HTTPException(400, otp_data.get("msg", "Failed to send OTP"))
+            raise HTTPException(400, otp_data.get("msg", otp_data.get("message", "Failed to send OTP")))
 
         return {"message": "OTP sent to your email"}
 
@@ -126,7 +129,7 @@ async def login_verify_otp(body: dict):
     async with httpx.AsyncClient() as c:
         res = await c.post(
             f"{SUPABASE_AUTH}/verify",
-            headers=SUPABASE_HEADERS,
+            headers=ANON_HEADERS,
             json={"email": email, "token": token, "type": "magiclink"}
         )
         data = res.json()
