@@ -2,8 +2,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
-import os, hashlib, httpx, random, smtplib, time, io
-from email.mime.text import MIMEText
+import os, io, httpx
 from dotenv import load_dotenv
 import pdfplumber
 import docx
@@ -23,59 +22,14 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 SUPABASE_URL = "https://jizieprrymxrtjnxdewy.supabase.co"
 SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImppemllcHJyeW14cnRqbnhkZXd5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIzODY2MTgsImV4cCI6MjA5Nzk2MjYxOH0.pvDT5l7fFWtsEpsZXtp8gmH39YQSWimKLJM2h6sRYUo"
+SUPABASE_AUTH = f"{SUPABASE_URL}/auth/v1"
 SUPABASE_HEADERS = {
     "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
 }
 
-SMTP_EMAIL = os.getenv("SMTP_EMAIL")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-
-# In-memory OTP store: { email: { otp, expires, purpose, password_hash } }
-otp_store = {}
 conversation_history = {}
 uploaded_files = {}
-
-def hash_password(p): return hashlib.sha256(p.encode()).hexdigest()
-
-def send_otp_email(to_email: str, otp: str, purpose: str):
-    subject = "Your OTP Code - AI Chatbot"
-    body = f"""
-Hi,
-
-Your OTP for {purpose} is:
-
-  {otp}
-
-This code expires in 5 minutes. Do not share it with anyone.
-
-— AI Chatbot Team
-"""
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = SMTP_EMAIL
-    msg["To"] = to_email
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(SMTP_EMAIL, SMTP_PASSWORD)
-        server.sendmail(SMTP_EMAIL, to_email, msg.as_string())
-
-# ── Models ──────────────────────────────────────────────
-class EmailRequest(BaseModel):
-    email: str
-
-class SignupRequest(BaseModel):
-    email: str
-    password: str
-
-class VerifyOTPRequest(BaseModel):
-    email: str
-    otp: str
-
-class LoginEmailRequest(BaseModel):
-    email: str
-    password: str
 
 class ChatRequest(BaseModel):
     message: str
@@ -86,94 +40,90 @@ class ChatRequest(BaseModel):
 def root():
     return {"status": "AI Chatbot API is running"}
 
-# ── SIGNUP: Step 1 — send OTP ────────────────────────────
-@app.post("/signup/send-otp")
-async def signup_send_otp(req: SignupRequest):
-    async with httpx.AsyncClient() as c:
-        check = await c.get(
-            f"{SUPABASE_URL}/rest/v1/users?email=eq.{req.email}",
-            headers=SUPABASE_HEADERS
-        )
-        if check.json():
-            raise HTTPException(400, "Email already registered")
-
-    otp = str(random.randint(100000, 999999))
-    otp_store[req.email] = {
-        "otp": otp,
-        "expires": time.time() + 300,
-        "purpose": "Signup",
-        "password_hash": hash_password(req.password)
-    }
-    send_otp_email(req.email, otp, "Signup")
-    return {"message": "OTP sent to your email"}
-
-# ── SIGNUP: Step 2 — verify OTP & create account ────────
-@app.post("/signup/verify-otp")
-async def signup_verify_otp(req: VerifyOTPRequest):
-    entry = otp_store.get(req.email)
-    if not entry or entry["purpose"] != "Signup":
-        raise HTTPException(400, "No OTP found. Please request again.")
-    if time.time() > entry["expires"]:
-        otp_store.pop(req.email, None)
-        raise HTTPException(400, "OTP expired. Please request again.")
-    if entry["otp"] != req.otp:
-        raise HTTPException(400, "Invalid OTP")
+# ── SIGNUP — Supabase sends OTP email automatically ─────
+@app.post("/signup")
+async def signup(body: dict):
+    email = body.get("email")
+    password = body.get("password")
+    if not email or not password:
+        raise HTTPException(400, "Email and password required")
 
     async with httpx.AsyncClient() as c:
         res = await c.post(
-            f"{SUPABASE_URL}/rest/v1/users",
-            headers={**SUPABASE_HEADERS, "Prefer": "return=representation"},
-            json={"email": req.email, "password": entry["password_hash"]}
+            f"{SUPABASE_AUTH}/signup",
+            headers=SUPABASE_HEADERS,
+            json={"email": email, "password": password}
         )
+        data = res.json()
         if res.status_code not in [200, 201]:
-            raise HTTPException(500, "Account creation failed")
-        user = res.json()[0]
+            raise HTTPException(400, data.get("msg", data.get("message", "Signup failed")))
+        # If email confirmation required, user gets OTP email from Supabase
+        return {"message": "OTP sent to your email. Please verify.", "email": email}
 
-    otp_store.pop(req.email, None)
-    return {"message": "Account created!", "user_id": user["id"], "email": user["email"]}
+# ── VERIFY OTP (email + token from Supabase email) ──────
+@app.post("/verify-otp")
+async def verify_otp(body: dict):
+    email = body.get("email")
+    token = body.get("token")
+    otp_type = body.get("type", "signup")  # "signup" or "email"
 
-# ── LOGIN: Step 1 — verify password & send OTP ──────────
+    async with httpx.AsyncClient() as c:
+        res = await c.post(
+            f"{SUPABASE_AUTH}/verify",
+            headers=SUPABASE_HEADERS,
+            json={"email": email, "token": token, "type": otp_type}
+        )
+        data = res.json()
+        if res.status_code != 200 or "error" in data:
+            raise HTTPException(400, data.get("msg", data.get("error_description", "Invalid OTP")))
+        user = data.get("user", {})
+        return {
+            "message": "Verified!",
+            "user_id": user.get("id"),
+            "email": user.get("email"),
+            "access_token": data.get("access_token")
+        }
+
+# ── LOGIN — Supabase sends OTP email automatically ──────
 @app.post("/login/send-otp")
-async def login_send_otp(req: LoginEmailRequest):
-    hashed = hash_password(req.password)
+async def login_send_otp(body: dict):
+    email = body.get("email")
+    if not email:
+        raise HTTPException(400, "Email required")
+
     async with httpx.AsyncClient() as c:
-        res = await c.get(
-            f"{SUPABASE_URL}/rest/v1/users?email=eq.{req.email}&password=eq.{hashed}",
-            headers=SUPABASE_HEADERS
+        res = await c.post(
+            f"{SUPABASE_AUTH}/otp",
+            headers=SUPABASE_HEADERS,
+            json={"email": email, "create_user": False}
         )
-        if not res.json():
-            raise HTTPException(401, "Invalid email or password")
+        if res.status_code not in [200, 201, 204]:
+            data = res.json()
+            raise HTTPException(400, data.get("msg", "Failed to send OTP"))
+        return {"message": "OTP sent to your email"}
 
-    otp = str(random.randint(100000, 999999))
-    otp_store[req.email] = {
-        "otp": otp,
-        "expires": time.time() + 300,
-        "purpose": "Login"
-    }
-    send_otp_email(req.email, otp, "Login")
-    return {"message": "OTP sent to your email"}
-
-# ── LOGIN: Step 2 — verify OTP ──────────────────────────
+# ── LOGIN VERIFY OTP ─────────────────────────────────────
 @app.post("/login/verify-otp")
-async def login_verify_otp(req: VerifyOTPRequest):
-    entry = otp_store.get(req.email)
-    if not entry or entry["purpose"] != "Login":
-        raise HTTPException(400, "No OTP found. Please request again.")
-    if time.time() > entry["expires"]:
-        otp_store.pop(req.email, None)
-        raise HTTPException(400, "OTP expired. Please request again.")
-    if entry["otp"] != req.otp:
-        raise HTTPException(400, "Invalid OTP")
+async def login_verify_otp(body: dict):
+    email = body.get("email")
+    token = body.get("token")
 
     async with httpx.AsyncClient() as c:
-        res = await c.get(
-            f"{SUPABASE_URL}/rest/v1/users?email=eq.{req.email}",
-            headers=SUPABASE_HEADERS
+        res = await c.post(
+            f"{SUPABASE_AUTH}/verify",
+            headers=SUPABASE_HEADERS,
+            json={"email": email, "token": token, "type": "magiclink"}
         )
-        user = res.json()[0]
-
-    otp_store.pop(req.email, None)
-    return {"message": "Login successful!", "user_id": user["id"], "email": user["email"]}
+        data = res.json()
+        if res.status_code != 200 or "error" in data:
+            raise HTTPException(400, data.get("msg", data.get("error_description", "Invalid OTP")))
+        user = data.get("user", {})
+        return {
+            "message": "Login successful!",
+            "user_id": user.get("id"),
+            "email": user.get("email"),
+            "access_token": data.get("access_token")
+        }
 
 # ── FILE UPLOAD ──────────────────────────────────────────
 @app.post("/upload")
