@@ -168,7 +168,12 @@ async def chat(req: ChatRequest):
     if req.user_id not in conversation_history:
         conversation_history[req.user_id] = []
 
-    system_prompt = "You are a helpful AI assistant expert in programming, robotics, deep learning and NLP. Always respond in the same language the user writes in."
+    system_prompt = (
+        "You are a helpful AI assistant expert in programming, robotics, deep learning and NLP. "
+        "You must only respond in English or Urdu (Roman Urdu or Urdu script, matching whatever the user uses). "
+        "If the user writes in any other language, politely reply in English and tell them you only support English and Urdu. "
+        "Never respond in any language other than English or Urdu, under any circumstances."
+    )
     if req.user_id in uploaded_files:
         system_prompt += f"\n\nThe user has uploaded a file. Here is its content:\n\n{uploaded_files[req.user_id]}\n\nAnswer questions based on this file content."
 
