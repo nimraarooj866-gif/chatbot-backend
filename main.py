@@ -30,8 +30,40 @@ ANON_HEADERS = {
     "Content-Type": "application/json",
 }
 
-conversation_history = {}
+SERVICE_HEADERS = {
+    "apikey": SUPABASE_SERVICE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=representation",
+}
+
+SUPABASE_REST = f"{SUPABASE_URL}/rest/v1"
+
 uploaded_files = {}
+
+# ── CHAT HISTORY HELPERS (Supabase DB) ──────────────────
+async def save_message(user_id: str, role: str, content: str):
+    async with httpx.AsyncClient() as c:
+        await c.post(
+            f"{SUPABASE_REST}/chat_messages",
+            headers=SERVICE_HEADERS,
+            json={"user_id": user_id, "role": role, "content": content}
+        )
+
+async def get_history(user_id: str, limit: int = 50):
+    async with httpx.AsyncClient() as c:
+        res = await c.get(
+            f"{SUPABASE_REST}/chat_messages",
+            headers=SERVICE_HEADERS,
+            params={
+                "user_id": f"eq.{user_id}",
+                "order": "created_at.asc",
+                "limit": str(limit),
+            }
+        )
+        if res.status_code != 200:
+            return []
+        return res.json()
 
 class ChatRequest(BaseModel):
     message: str
@@ -165,8 +197,9 @@ async def upload_file(file: UploadFile = File(...), user_id: str = "default"):
 # ── CHAT ─────────────────────────────────────────────────
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    if req.user_id not in conversation_history:
-        conversation_history[req.user_id] = []
+    # Load past messages from Supabase
+    past_messages = await get_history(req.user_id)
+    messages = [{"role": m["role"], "content": m["content"]} for m in past_messages]
 
     system_prompt = (
         "You are a helpful AI assistant expert in programming, robotics, deep learning and NLP. "
@@ -177,14 +210,39 @@ async def chat(req: ChatRequest):
     if req.user_id in uploaded_files:
         system_prompt += f"\n\nThe user has uploaded a file. Here is its content:\n\n{uploaded_files[req.user_id]}\n\nAnswer questions based on this file content."
 
-    conversation_history[req.user_id].append({"role": "user", "content": req.message})
+    messages.append({"role": "user", "content": req.message})
+    await save_message(req.user_id, "user", req.message)
+
     response = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "system", "content": system_prompt}] + conversation_history[req.user_id]
+        messages=[{"role": "system", "content": system_prompt}] + messages
     )
     reply = response.choices[0].message.content
-    conversation_history[req.user_id].append({"role": "assistant", "content": reply})
+
+    await save_message(req.user_id, "assistant", reply)
+
     return {"reply": reply}
+
+# ── GET CHAT HISTORY ─────────────────────────────────────
+@app.get("/history/{user_id}")
+async def history(user_id: str):
+    past_messages = await get_history(user_id)
+    return {
+        "history": [
+            {"role": m["role"], "content": m["content"]} for m in past_messages
+        ]
+    }
+
+# ── CLEAR CHAT HISTORY ───────────────────────────────────
+@app.delete("/clear-history/{user_id}")
+async def clear_history(user_id: str):
+    async with httpx.AsyncClient() as c:
+        await c.delete(
+            f"{SUPABASE_REST}/chat_messages",
+            headers=SERVICE_HEADERS,
+            params={"user_id": f"eq.{user_id}"}
+        )
+    return {"message": "Chat history cleared"}
 
 # ── CLEAR FILE ───────────────────────────────────────────
 @app.delete("/clear-file/{user_id}")
