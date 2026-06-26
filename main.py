@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
-import os, io, httpx
+import os, io, httpx, random, string
 from dotenv import load_dotenv
 import pdfplumber
 import docx
@@ -28,19 +28,22 @@ SUPABASE_HEADERS = {
     "Content-Type": "application/json",
 }
 
+SMTP_EMAIL = os.getenv("SMTP_EMAIL")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+
 conversation_history = {}
 uploaded_files = {}
+login_otp_store = {}  # email -> otp (temporary in-memory)
 
 class ChatRequest(BaseModel):
     message: str
     user_id: str = "default"
 
-# ── Root ────────────────────────────────────────────────
 @app.get("/")
 def root():
     return {"status": "AI Chatbot API is running"}
 
-# ── SIGNUP — Supabase sends OTP email automatically ─────
+# ── SIGNUP ──────────────────────────────────────────────
 @app.post("/signup")
 async def signup(body: dict):
     email = body.get("email")
@@ -57,15 +60,14 @@ async def signup(body: dict):
         data = res.json()
         if res.status_code not in [200, 201]:
             raise HTTPException(400, data.get("msg", data.get("message", "Signup failed")))
-        # If email confirmation required, user gets OTP email from Supabase
         return {"message": "OTP sent to your email. Please verify.", "email": email}
 
-# ── VERIFY OTP (email + token from Supabase email) ──────
+# ── VERIFY SIGNUP OTP ───────────────────────────────────
 @app.post("/verify-otp")
 async def verify_otp(body: dict):
     email = body.get("email")
     token = body.get("token")
-    otp_type = body.get("type", "signup")  # "signup" or "email"
+    otp_type = body.get("type", "signup")
 
     async with httpx.AsyncClient() as c:
         res = await c.post(
@@ -84,25 +86,38 @@ async def verify_otp(body: dict):
             "access_token": data.get("access_token")
         }
 
-# ── LOGIN — Supabase sends OTP email automatically ──────
+# ── LOGIN STEP 1: Verify password, then send OTP via Supabase magic link ──
 @app.post("/login/send-otp")
 async def login_send_otp(body: dict):
     email = body.get("email")
-    if not email:
-        raise HTTPException(400, "Email required")
+    password = body.get("password")
+    if not email or not password:
+        raise HTTPException(400, "Email and password required")
 
     async with httpx.AsyncClient() as c:
+        # Step 1: Verify password is correct
         res = await c.post(
-            f"{SUPABASE_AUTH}/otp",
+            f"{SUPABASE_AUTH}/token?grant_type=password",
+            headers=SUPABASE_HEADERS,
+            json={"email": email, "password": password}
+        )
+        data = res.json()
+        if res.status_code != 200:
+            raise HTTPException(400, data.get("error_description", "Invalid email or password"))
+
+        # Step 2: Password correct — now send OTP via magic link
+        otp_res = await c.post(
+            f"{SUPABASE_AUTH}/magiclink",
             headers=SUPABASE_HEADERS,
             json={"email": email, "create_user": False}
         )
-        if res.status_code not in [200, 201, 204]:
-            data = res.json()
-            raise HTTPException(400, data.get("msg", "Failed to send OTP"))
+        if otp_res.status_code not in [200, 201, 204]:
+            otp_data = otp_res.json()
+            raise HTTPException(400, otp_data.get("msg", "Failed to send OTP"))
+
         return {"message": "OTP sent to your email"}
 
-# ── LOGIN VERIFY OTP ─────────────────────────────────────
+# ── LOGIN STEP 2: Verify OTP ────────────────────────────
 @app.post("/login/verify-otp")
 async def login_verify_otp(body: dict):
     email = body.get("email")
