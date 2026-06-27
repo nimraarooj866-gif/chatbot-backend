@@ -106,6 +106,7 @@ class ChatRequest(BaseModel):
     message: str
     user_id: str = "default"
     chat_id: Optional[str] = None
+    docs_enabled: bool = True
 
 
 # ── ROOT ─────────────────────────────────────────────────
@@ -269,7 +270,7 @@ async def delete_chat(chat_id: str):
 
 # ── MESSAGES: GET MESSAGES FOR A CHAT ────────────────────
 
-@app.get("/chats/{chat_id}/messages")
+@app.get("/messages/{chat_id}")
 async def get_chat_messages(chat_id: str):
     msgs = await get_messages_for_chat(chat_id)
     return {"messages": [{"role": m["role"], "content": m["content"]} for m in msgs]}
@@ -293,7 +294,7 @@ async def chat(req: ChatRequest):
         "If the user writes in any other language, politely reply in English and tell them you only support English and Urdu. "
         "Never respond in any language other than English or Urdu, under any circumstances."
     )
-    if req.user_id in uploaded_files:
+    if req.docs_enabled and req.user_id in uploaded_files:
         system_prompt += f"\n\nThe user has uploaded a file. Here is its content:\n\n{uploaded_files[req.user_id]}\n\nAnswer questions based on this file content."
 
     messages.append({"role": "user", "content": req.message})
@@ -332,7 +333,11 @@ async def upload_file(file: UploadFile = File(...), user_id: str = "default"):
         text = content.decode("utf-8")
     else:
         raise HTTPException(400, "Only PDF, DOCX, TXT supported")
-    uploaded_files[user_id] = text[:5000]
+    # Append to existing (multiple file support)
+    existing = uploaded_files.get(user_id, "")
+    separator = f"\n\n--- File: {file.filename} ---\n\n"
+    combined = (existing + separator + text).strip()
+    uploaded_files[user_id] = combined[:10000]
     return {"message": f"File '{file.filename}' uploaded successfully!"}
 
 
