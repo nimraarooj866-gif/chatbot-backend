@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 from openai import OpenAI
 import os, io, httpx, uuid
 from dotenv import load_dotenv
@@ -104,7 +105,7 @@ async def update_chat_title(chat_id: str, title: str):
 class ChatRequest(BaseModel):
     message: str
     user_id: str = "default"
-    chat_id: str = None
+    chat_id: Optional[str] = None
 
 
 # ── ROOT ─────────────────────────────────────────────────
@@ -216,6 +217,17 @@ async def login_verify_otp(body: dict):
         }
 
 
+# ── CHATS: CREATE NEW CHAT ────────────────────────────────
+
+@app.post("/chats/new")
+async def new_chat(body: dict):
+    user_id = body.get("user_id")
+    if not user_id:
+        raise HTTPException(400, "user_id required")
+    chat = await get_or_create_chat(user_id, title="New Chat")
+    return {"chat": chat}
+
+
 # ── CHATS: LIST ALL CHATS FOR USER ───────────────────────
 
 @app.get("/chats/{user_id}")
@@ -233,17 +245,6 @@ async def list_chats(user_id: str):
         if res.status_code != 200:
             return {"chats": []}
         return {"chats": res.json()}
-
-
-# ── CHATS: CREATE NEW CHAT ────────────────────────────────
-
-@app.post("/chats/new")
-async def new_chat(body: dict):
-    user_id = body.get("user_id")
-    if not user_id:
-        raise HTTPException(400, "user_id required")
-    chat = await get_or_create_chat(user_id, title="New Chat")
-    return {"chat": chat}
 
 
 # ── CHATS: DELETE A CHAT ─────────────────────────────────
