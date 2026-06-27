@@ -40,7 +40,7 @@ SERVICE_HEADERS = {
 
 SUPABASE_REST = f"{SUPABASE_URL}/rest/v1"
 
-uploaded_files = {}  # {user_id: text}
+uploaded_files = {}  # {user_id: text} — in-memory cache for active session
 
 
 # ── CHAT HISTORY HELPERS ─────────────────────────────────
@@ -71,7 +71,6 @@ async def get_messages_for_chat(chat_id: str, limit: int = 50):
 async def get_or_create_chat(user_id: str, chat_id: str = None, title: str = "New Chat"):
     async with httpx.AsyncClient() as c:
         if chat_id:
-            # Return existing chat
             res = await c.get(
                 f"{SUPABASE_REST}/chats",
                 headers=SERVICE_HEADERS,
@@ -79,7 +78,6 @@ async def get_or_create_chat(user_id: str, chat_id: str = None, title: str = "Ne
             )
             if res.status_code == 200 and res.json():
                 return res.json()[0]
-        # Create new chat
         new_id = str(uuid.uuid4())
         res = await c.post(
             f"{SUPABASE_REST}/chats",
@@ -253,13 +251,11 @@ async def list_chats(user_id: str):
 @app.delete("/chats/{chat_id}")
 async def delete_chat(chat_id: str):
     async with httpx.AsyncClient() as c:
-        # Delete messages first
         await c.delete(
             f"{SUPABASE_REST}/chat_messages",
             headers=SERVICE_HEADERS,
             params={"chat_id": f"eq.{chat_id}"}
         )
-        # Delete chat
         await c.delete(
             f"{SUPABASE_REST}/chats",
             headers=SERVICE_HEADERS,
@@ -280,11 +276,9 @@ async def get_chat_messages(chat_id: str):
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    # Get or create chat
     chat_obj = await get_or_create_chat(req.user_id, req.chat_id)
     chat_id = chat_obj["id"]
 
-    # Load past messages for this chat
     past_messages = await get_messages_for_chat(chat_id)
     messages = [{"role": m["role"], "content": m["content"]} for m in past_messages]
 
@@ -294,8 +288,17 @@ async def chat(req: ChatRequest):
         "If the user writes in any other language, politely reply in English and tell them you only support English and Urdu. "
         "Never respond in any language other than English or Urdu, under any circumstances."
     )
-    if req.docs_enabled and req.user_id in uploaded_files:
-        system_prompt += f"\n\nThe user has uploaded a file. Here is its content:\n\n{uploaded_files[req.user_id]}\n\nAnswer questions based on this file content."
+
+    # Use in-memory cache if available, else load from Supabase
+    if req.docs_enabled:
+        doc_text = uploaded_files.get(req.user_id)
+        if not doc_text:
+            # Load from Supabase and rebuild cache
+            doc_text = await get_combined_doc_text(req.user_id)
+            if doc_text:
+                uploaded_files[req.user_id] = doc_text
+        if doc_text:
+            system_prompt += f"\n\nThe user has uploaded file(s). Here is the content:\n\n{doc_text}\n\nAnswer questions based on this file content."
 
     messages.append({"role": "user", "content": req.message})
     await save_message(req.user_id, chat_id, "user", req.message)
@@ -308,7 +311,6 @@ async def chat(req: ChatRequest):
 
     await save_message(req.user_id, chat_id, "assistant", reply)
 
-    # Auto-title: set title from first user message (first exchange only)
     if len(past_messages) == 0:
         title = req.message[:50] + ("..." if len(req.message) > 50 else "")
         await update_chat_title(chat_id, title)
@@ -333,27 +335,113 @@ async def upload_file(file: UploadFile = File(...), user_id: str = "default"):
         text = content.decode("utf-8")
     else:
         raise HTTPException(400, "Only PDF, DOCX, TXT supported")
-    # Append to existing (multiple file support)
+
+    # Save to Supabase user_docs table
+    async with httpx.AsyncClient() as c:
+        # Check if doc with same name exists for this user — replace it
+        del_res = await c.delete(
+            f"{SUPABASE_REST}/user_docs",
+            headers=SERVICE_HEADERS,
+            params={"user_id": f"eq.{user_id}", "filename": f"eq.{file.filename}"}
+        )
+        insert_res = await c.post(
+            f"{SUPABASE_REST}/user_docs",
+            headers=SERVICE_HEADERS,
+            json={
+                "user_id": user_id,
+                "filename": file.filename,
+                "content": text[:10000]
+            }
+        )
+        if insert_res.status_code not in [200, 201]:
+            raise HTTPException(500, "Failed to save document to database")
+
+    # Update in-memory cache
     existing = uploaded_files.get(user_id, "")
     separator = f"\n\n--- File: {file.filename} ---\n\n"
     combined = (existing + separator + text).strip()
-    uploaded_files[user_id] = combined[:10000]
+    uploaded_files[user_id] = combined[:50000]
+
     return {"message": f"File '{file.filename}' uploaded successfully!"}
 
 
-# ── CLEAR FILE ────────────────────────────────────────────
+# ── DOCS: GET USER DOCS LIST ──────────────────────────────
+
+@app.get("/docs/{user_id}")
+async def get_user_docs(user_id: str):
+    async with httpx.AsyncClient() as c:
+        res = await c.get(
+            f"{SUPABASE_REST}/user_docs",
+            headers=SERVICE_HEADERS,
+            params={
+                "user_id": f"eq.{user_id}",
+                "order": "created_at.asc",
+                "select": "id,filename,created_at"  # don't send full content to frontend
+            }
+        )
+        if res.status_code != 200:
+            return {"docs": []}
+        return {"docs": res.json()}
+
+
+# ── DOCS: DELETE A SPECIFIC DOC ───────────────────────────
+
+@app.delete("/docs/{user_id}/{filename}")
+async def delete_doc(user_id: str, filename: str):
+    async with httpx.AsyncClient() as c:
+        await c.delete(
+            f"{SUPABASE_REST}/user_docs",
+            headers=SERVICE_HEADERS,
+            params={"user_id": f"eq.{user_id}", "filename": f"eq.{filename}"}
+        )
+    # Rebuild in-memory cache
+    uploaded_files.pop(user_id, None)
+    doc_text = await get_combined_doc_text(user_id)
+    if doc_text:
+        uploaded_files[user_id] = doc_text
+    return {"message": f"Doc '{filename}' deleted"}
+
+
+# ── DOCS HELPER: GET COMBINED TEXT FROM SUPABASE ─────────
+
+async def get_combined_doc_text(user_id: str) -> str:
+    async with httpx.AsyncClient() as c:
+        res = await c.get(
+            f"{SUPABASE_REST}/user_docs",
+            headers=SERVICE_HEADERS,
+            params={
+                "user_id": f"eq.{user_id}",
+                "order": "created_at.asc",
+                "select": "filename,content"
+            }
+        )
+        if res.status_code != 200 or not res.json():
+            return ""
+        parts = []
+        for doc in res.json():
+            parts.append(f"--- File: {doc['filename']} ---\n\n{doc['content']}")
+        return "\n\n".join(parts)[:50000]
+
+
+# ── CLEAR FILE (legacy + now also clears Supabase) ────────
 
 @app.delete("/clear-file/{user_id}")
-def clear_file(user_id: str):
+async def clear_file(user_id: str):
     uploaded_files.pop(user_id, None)
-    return {"message": "File cleared"}
+    # Also clear from Supabase
+    async with httpx.AsyncClient() as c:
+        await c.delete(
+            f"{SUPABASE_REST}/user_docs",
+            headers=SERVICE_HEADERS,
+            params={"user_id": f"eq.{user_id}"}
+        )
+    return {"message": "All files cleared"}
 
 
-# ── LEGACY: GET ALL HISTORY (kept for backwards compat) ──
+# ── LEGACY: GET ALL HISTORY ───────────────────────────────
 
 @app.get("/history/{user_id}")
 async def history(user_id: str):
-    # Returns messages from the most recent chat for backwards compatibility
     async with httpx.AsyncClient() as c:
         res = await c.get(
             f"{SUPABASE_REST}/chats",
