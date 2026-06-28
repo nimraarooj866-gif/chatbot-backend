@@ -2,11 +2,17 @@ from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-from openai import OpenAI
 import os, io, httpx, uuid
 from dotenv import load_dotenv
+
+# LangChain imports
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.schema import SystemMessage, HumanMessage, AIMessage
+
+# File parsing
 import pdfplumber
-import docx
+import docx as python_docx
 
 load_dotenv()
 
@@ -19,8 +25,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# ── LangChain LLM + Embeddings ───────────────────────────
+llm = ChatOpenAI(
+    model="gpt-4o-mini",
+    api_key=os.getenv("OPENAI_API_KEY"),
+    temperature=0.7
+)
 
+embeddings_model = OpenAIEmbeddings(
+    model="text-embedding-3-small",
+    api_key=os.getenv("OPENAI_API_KEY")
+)
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=500,
+    chunk_overlap=50
+)
+
+# ── Supabase Config ──────────────────────────────────────
 SUPABASE_URL = "https://jizieprrymxrtjnxdewy.supabase.co"
 SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImppemllcHJyeW14cnRqbnhkZXd5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIzODY2MTgsImV4cCI6MjA5Nzk2MjYxOH0.pvDT5l7fFWtsEpsZXtp8gmH39YQSWimKLJM2h6sRYUo"
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
@@ -40,11 +62,22 @@ SERVICE_HEADERS = {
 
 SUPABASE_REST = f"{SUPABASE_URL}/rest/v1"
 
-uploaded_files = {}  # {user_id: text} — in-memory cache for active session
+
+# ── Models ───────────────────────────────────────────────
+class ChatRequest(BaseModel):
+    message: str
+    user_id: str = "default"
+    chat_id: Optional[str] = None
+    docs_enabled: bool = True
 
 
-# ── CHAT HISTORY HELPERS ─────────────────────────────────
+# ── Root ─────────────────────────────────────────────────
+@app.get("/")
+def root():
+    return {"status": "AI Chatbot API is running"}
 
+
+# ── Chat History Helpers ──────────────────────────────────
 async def save_message(user_id: str, chat_id: str, role: str, content: str):
     async with httpx.AsyncClient() as c:
         await c.post(
@@ -98,24 +131,52 @@ async def update_chat_title(chat_id: str, title: str):
         )
 
 
-# ── MODELS ──────────────────────────────────────────────
+# ── RAG: Store Chunks with Embeddings ────────────────────
+async def store_chunks(user_id: str, filename: str, text: str):
+    chunks = text_splitter.split_text(text)
+    async with httpx.AsyncClient(timeout=60.0) as c:
+        for chunk in chunks:
+            embedding = embeddings_model.embed_query(chunk)
+            await c.post(
+                f"{SUPABASE_REST}/doc_chunks",
+                headers=SERVICE_HEADERS,
+                json={
+                    "user_id": user_id,
+                    "filename": filename,
+                    "content": chunk,
+                    "embedding": embedding
+                }
+            )
 
-class ChatRequest(BaseModel):
-    message: str
-    user_id: str = "default"
-    chat_id: Optional[str] = None
-    docs_enabled: bool = True
+async def retrieve_relevant_chunks(user_id: str, query: str, top_k: int = 5) -> str:
+    query_embedding = embeddings_model.embed_query(query)
+    async with httpx.AsyncClient(timeout=30.0) as c:
+        res = await c.post(
+            f"{SUPABASE_URL}/rest/v1/rpc/match_doc_chunks",
+            headers=SERVICE_HEADERS,
+            json={
+                "query_embedding": query_embedding,
+                "match_user_id": user_id,
+                "match_count": top_k
+            }
+        )
+        if res.status_code != 200 or not res.json():
+            return ""
+        chunks = res.json()
+        # Group by filename for context
+        parts = []
+        seen_files = {}
+        for chunk in chunks:
+            fname = chunk.get("filename", "document")
+            if fname not in seen_files:
+                seen_files[fname] = []
+            seen_files[fname].append(chunk["content"])
+        for fname, contents in seen_files.items():
+            parts.append(f"--- From: {fname} ---\n" + "\n".join(contents))
+        return "\n\n".join(parts)
 
 
-# ── ROOT ─────────────────────────────────────────────────
-
-@app.get("/")
-def root():
-    return {"status": "AI Chatbot API is running"}
-
-
-# ── AUTH: SIGNUP ─────────────────────────────────────────
-
+# ── AUTH: Signup ─────────────────────────────────────────
 @app.post("/signup")
 async def signup(body: dict):
     email = body.get("email")
@@ -134,8 +195,7 @@ async def signup(body: dict):
         return {"message": "OTP sent to your email.", "email": email}
 
 
-# ── AUTH: VERIFY SIGNUP OTP ──────────────────────────────
-
+# ── AUTH: Verify Signup OTP ───────────────────────────────
 @app.post("/verify-otp")
 async def verify_otp(body: dict):
     email = body.get("email")
@@ -159,8 +219,7 @@ async def verify_otp(body: dict):
         }
 
 
-# ── AUTH: LOGIN STEP 1 ───────────────────────────────────
-
+# ── AUTH: Login Step 1 ────────────────────────────────────
 @app.post("/login/send-otp")
 async def login_send_otp(body: dict):
     email = body.get("email")
@@ -192,8 +251,7 @@ async def login_send_otp(body: dict):
         return {"message": "OTP sent to your email"}
 
 
-# ── AUTH: LOGIN STEP 2 ───────────────────────────────────
-
+# ── AUTH: Login Step 2 ────────────────────────────────────
 @app.post("/login/verify-otp")
 async def login_verify_otp(body: dict):
     email = body.get("email")
@@ -216,8 +274,7 @@ async def login_verify_otp(body: dict):
         }
 
 
-# ── CHATS: CREATE NEW CHAT ────────────────────────────────
-
+# ── Chats: New ────────────────────────────────────────────
 @app.post("/chats/new")
 async def new_chat(body: dict):
     user_id = body.get("user_id")
@@ -227,8 +284,7 @@ async def new_chat(body: dict):
     return {"chat": chat}
 
 
-# ── CHATS: LIST ALL CHATS FOR USER ───────────────────────
-
+# ── Chats: List ───────────────────────────────────────────
 @app.get("/chats/{user_id}")
 async def list_chats(user_id: str):
     async with httpx.AsyncClient() as c:
@@ -246,8 +302,7 @@ async def list_chats(user_id: str):
         return {"chats": res.json()}
 
 
-# ── CHATS: DELETE A CHAT ─────────────────────────────────
-
+# ── Chats: Delete ─────────────────────────────────────────
 @app.delete("/chats/{chat_id}")
 async def delete_chat(chat_id: str):
     async with httpx.AsyncClient() as c:
@@ -264,23 +319,20 @@ async def delete_chat(chat_id: str):
     return {"message": "Chat deleted"}
 
 
-# ── MESSAGES: GET MESSAGES FOR A CHAT ────────────────────
-
+# ── Messages: Get ─────────────────────────────────────────
 @app.get("/messages/{chat_id}")
 async def get_chat_messages(chat_id: str):
     msgs = await get_messages_for_chat(chat_id)
     return {"messages": [{"role": m["role"], "content": m["content"]} for m in msgs]}
 
 
-# ── CHAT: SEND MESSAGE ────────────────────────────────────
-
+# ── Chat: Send Message (LangChain) ────────────────────────
 @app.post("/chat")
 async def chat(req: ChatRequest):
     chat_obj = await get_or_create_chat(req.user_id, req.chat_id)
     chat_id = chat_obj["id"]
 
     past_messages = await get_messages_for_chat(chat_id)
-    messages = [{"role": m["role"], "content": m["content"]} for m in past_messages]
 
     system_prompt = (
         "You are a helpful AI assistant expert in programming, robotics, deep learning and NLP. "
@@ -289,28 +341,35 @@ async def chat(req: ChatRequest):
         "Never respond in any language other than English or Urdu, under any circumstances."
     )
 
-    # Use in-memory cache if available, else load from Supabase
+    # RAG: retrieve relevant chunks if docs enabled
     if req.docs_enabled:
-        doc_text = uploaded_files.get(req.user_id)
-        if not doc_text:
-            # Load from Supabase and rebuild cache
-            doc_text = await get_combined_doc_text(req.user_id)
-            if doc_text:
-                uploaded_files[req.user_id] = doc_text
-        if doc_text:
-            system_prompt += f"\n\nThe user has uploaded file(s). Here is the content:\n\n{doc_text}\n\nAnswer questions based on this file content."
+        relevant_context = await retrieve_relevant_chunks(req.user_id, req.message)
+        if relevant_context:
+            system_prompt += (
+                f"\n\nThe user has uploaded documents. Here are the most relevant excerpts for their question:\n\n"
+                f"{relevant_context}\n\n"
+                f"Answer based on this content when relevant."
+            )
 
-    messages.append({"role": "user", "content": req.message})
+    # Build LangChain messages
+    lc_messages = [SystemMessage(content=system_prompt)]
+    for m in past_messages:
+        if m["role"] == "user":
+            lc_messages.append(HumanMessage(content=m["content"]))
+        else:
+            lc_messages.append(AIMessage(content=m["content"]))
+    lc_messages.append(HumanMessage(content=req.message))
+
+    # Save user message
     await save_message(req.user_id, chat_id, "user", req.message)
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "system", "content": system_prompt}] + messages
-    )
-    reply = response.choices[0].message.content
+    # LangChain LLM call
+    response = llm.invoke(lc_messages)
+    reply = response.content
 
     await save_message(req.user_id, chat_id, "assistant", reply)
 
+    # Auto-title from first message
     if len(past_messages) == 0:
         title = req.message[:50] + ("..." if len(req.message) > 50 else "")
         await update_chat_title(chat_id, title)
@@ -318,55 +377,59 @@ async def chat(req: ChatRequest):
     return {"reply": reply, "chat_id": chat_id}
 
 
-# ── FILE UPLOAD ───────────────────────────────────────────
-
+# ── File Upload (LangChain chunking + embeddings) ─────────
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...), user_id: str = "default"):
     content = await file.read()
     text = ""
+
     if file.filename.endswith(".pdf"):
         with pdfplumber.open(io.BytesIO(content)) as pdf:
             for page in pdf.pages:
                 text += page.extract_text() or ""
     elif file.filename.endswith(".docx"):
-        d = docx.Document(io.BytesIO(content))
+        d = python_docx.Document(io.BytesIO(content))
         text = "\n".join([p.text for p in d.paragraphs])
     elif file.filename.endswith(".txt"):
         text = content.decode("utf-8")
     else:
         raise HTTPException(400, "Only PDF, DOCX, TXT supported")
 
-    # Save to Supabase user_docs table
+    if not text.strip():
+        raise HTTPException(400, "Could not extract text from file")
+
+    # Delete old chunks for this file (replace on re-upload)
     async with httpx.AsyncClient() as c:
-        # Check if doc with same name exists for this user — replace it
-        del_res = await c.delete(
+        await c.delete(
+            f"{SUPABASE_REST}/doc_chunks",
+            headers=SERVICE_HEADERS,
+            params={"user_id": f"eq.{user_id}", "filename": f"eq.{file.filename}"}
+        )
+
+    # Also update user_docs table (for file list)
+    async with httpx.AsyncClient() as c:
+        await c.delete(
             f"{SUPABASE_REST}/user_docs",
             headers=SERVICE_HEADERS,
             params={"user_id": f"eq.{user_id}", "filename": f"eq.{file.filename}"}
         )
-        insert_res = await c.post(
+        await c.post(
             f"{SUPABASE_REST}/user_docs",
             headers=SERVICE_HEADERS,
             json={
                 "user_id": user_id,
                 "filename": file.filename,
-                "content": text[:10000]
+                "content": text[:500]  # preview only
             }
         )
-        if insert_res.status_code not in [200, 201]:
-            raise HTTPException(500, "Failed to save document to database")
 
-    # Update in-memory cache
-    existing = uploaded_files.get(user_id, "")
-    separator = f"\n\n--- File: {file.filename} ---\n\n"
-    combined = (existing + separator + text).strip()
-    uploaded_files[user_id] = combined[:50000]
+    # Store chunks with embeddings
+    await store_chunks(user_id, file.filename, text)
 
-    return {"message": f"File '{file.filename}' uploaded successfully!"}
+    return {"message": f"File '{file.filename}' uploaded and indexed successfully!"}
 
 
-# ── DOCS: GET USER DOCS LIST ──────────────────────────────
-
+# ── Docs: List ────────────────────────────────────────────
 @app.get("/docs/{user_id}")
 async def get_user_docs(user_id: str):
     async with httpx.AsyncClient() as c:
@@ -376,7 +439,7 @@ async def get_user_docs(user_id: str):
             params={
                 "user_id": f"eq.{user_id}",
                 "order": "created_at.asc",
-                "select": "id,filename,created_at"  # don't send full content to frontend
+                "select": "id,filename,created_at"
             }
         )
         if res.status_code != 200:
@@ -384,8 +447,7 @@ async def get_user_docs(user_id: str):
         return {"docs": res.json()}
 
 
-# ── DOCS: DELETE A SPECIFIC DOC ───────────────────────────
-
+# ── Docs: Delete One ──────────────────────────────────────
 @app.delete("/docs/{user_id}/{filename}")
 async def delete_doc(user_id: str, filename: str):
     async with httpx.AsyncClient() as c:
@@ -394,52 +456,32 @@ async def delete_doc(user_id: str, filename: str):
             headers=SERVICE_HEADERS,
             params={"user_id": f"eq.{user_id}", "filename": f"eq.{filename}"}
         )
-    # Rebuild in-memory cache
-    uploaded_files.pop(user_id, None)
-    doc_text = await get_combined_doc_text(user_id)
-    if doc_text:
-        uploaded_files[user_id] = doc_text
+        await c.delete(
+            f"{SUPABASE_REST}/doc_chunks",
+            headers=SERVICE_HEADERS,
+            params={"user_id": f"eq.{user_id}", "filename": f"eq.{filename}"}
+        )
     return {"message": f"Doc '{filename}' deleted"}
 
 
-# ── DOCS HELPER: GET COMBINED TEXT FROM SUPABASE ─────────
-
-async def get_combined_doc_text(user_id: str) -> str:
-    async with httpx.AsyncClient() as c:
-        res = await c.get(
-            f"{SUPABASE_REST}/user_docs",
-            headers=SERVICE_HEADERS,
-            params={
-                "user_id": f"eq.{user_id}",
-                "order": "created_at.asc",
-                "select": "filename,content"
-            }
-        )
-        if res.status_code != 200 or not res.json():
-            return ""
-        parts = []
-        for doc in res.json():
-            parts.append(f"--- File: {doc['filename']} ---\n\n{doc['content']}")
-        return "\n\n".join(parts)[:50000]
-
-
-# ── CLEAR FILE (legacy + now also clears Supabase) ────────
-
+# ── Clear All Files ───────────────────────────────────────
 @app.delete("/clear-file/{user_id}")
 async def clear_file(user_id: str):
-    uploaded_files.pop(user_id, None)
-    # Also clear from Supabase
     async with httpx.AsyncClient() as c:
         await c.delete(
             f"{SUPABASE_REST}/user_docs",
             headers=SERVICE_HEADERS,
             params={"user_id": f"eq.{user_id}"}
         )
+        await c.delete(
+            f"{SUPABASE_REST}/doc_chunks",
+            headers=SERVICE_HEADERS,
+            params={"user_id": f"eq.{user_id}"}
+        )
     return {"message": "All files cleared"}
 
 
-# ── LEGACY: GET ALL HISTORY ───────────────────────────────
-
+# ── Legacy: History ───────────────────────────────────────
 @app.get("/history/{user_id}")
 async def history(user_id: str):
     async with httpx.AsyncClient() as c:
